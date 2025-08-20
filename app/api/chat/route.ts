@@ -1,71 +1,68 @@
-import 'server-only'
-import { OpenAIStream, StreamingTextResponse } from 'ai'
-import { Configuration, OpenAIApi } from 'openai-edge'
-import { createRouteHandlerClient } from '@supabase/auth-helpers-nextjs'
-import { cookies } from 'next/headers'
-import { Database } from '@/lib/db_types'
+// app/api/chat/route.ts
+export const runtime = 'edge'; // solo una vez
 
-import { auth } from '@/auth'
-import { nanoid } from '@/lib/utils'
-
-export const runtime = 'edge'
-
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY
-})
-
-const openai = new OpenAIApi(configuration)
+function env(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Falta variable de entorno: ${name}`);
+  return v;
+}
 
 export async function POST(req: Request) {
-  const cookieStore = cookies()
-  const supabase = createRouteHandlerClient<Database>({
-    cookies: () => cookieStore
-  })
-  const json = await req.json()
-  const { messages, previewToken } = json
-  const userId = (await auth({ cookieStore }))?.user.id
+  try {
+    const { messages, system, model } = await req.json();
 
-  if (!userId) {
-    return new Response('Unauthorized', {
-      status: 401
-    })
-  }
-
-  if (previewToken) {
-    configuration.apiKey = previewToken
-  }
-
-  const res = await openai.createChatCompletion({
-    model: 'gpt-3.5-turbo',
-    messages,
-    temperature: 0.7,
-    stream: true
-  })
-
-  const stream = OpenAIStream(res, {
-    async onCompletion(completion) {
-      const title = json.messages[0].content.substring(0, 100)
-      const id = json.id ?? nanoid()
-      const createdAt = Date.now()
-      const path = `/chat/${id}`
-      const payload = {
-        id,
-        title,
-        userId,
-        createdAt,
-        path,
-        messages: [
-          ...messages,
-          {
-            content: completion,
-            role: 'assistant'
-          }
-        ]
-      }
-      // Insert chat into database.
-      await supabase.from('chats').upsert({ id, payload }).throwOnError()
+    if (!messages || !Array.isArray(messages)) {
+      return new Response(JSON.stringify({ error: 'Formato inválido: falta messages[]' }), { status: 400 });
     }
-  })
 
-  return new StreamingTextResponse(stream)
+    const apiKey = env('OPENROUTER_API_KEY');
+    const baseURL = 'https://openrouter.ai/api/v1';
+    const modelId = model || process.env.OPENROUTER_MODEL || 'openrouter/auto';
+
+    // Llamada directa a OpenRouter (sin streaming para simplificar)
+    const res = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.SITE_URL || 'http://localhost:3000',
+        'X-Title': 'Viability Chat MVP',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          ...(system ? [{ role: 'system', content: system }] : []),
+          ...messages,
+        ],
+        stream: false,
+        max_tokens: 512,
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      return new Response(JSON.stringify({
+        error: `OpenRouter no responde OK (${res.status}).`,
+        hint: text || 'Revisa API key, modelo o límites.',
+      }), { status: 502 });
+    }
+
+    const data = await res.json();
+    const content =
+      data?.choices?.[0]?.message?.content ??
+      data?.choices?.[0]?.text ??
+      '';
+
+    if (!content) {
+      return new Response(JSON.stringify({ error: 'Respuesta vacía del modelo.' }), { status: 502 });
+    }
+
+    // Devolvemos texto plano; tu frontend ya va leyendo del body.
+    return new Response(content, {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      status: 200,
+    });
+  } catch (err: any) {
+    return new Response(JSON.stringify({ error: err?.message || String(err) }), { status: 500 });
+  }
 }
